@@ -1,0 +1,104 @@
+{
+  "build": [
+    [
+      "python3",
+      ".fleet/telemetry.py",
+      "build"
+    ]
+  ],
+  "tests": [
+    [
+      "python3",
+      ".fleet/telemetry.py",
+      "test"
+    ]
+  ],
+  "workload": {
+    "argv": [
+      "python3",
+      ".fleet/telemetry.py",
+      "workload",
+      "--report",
+      ".fleet/last-wall.json"
+    ],
+    "timeout_s": 120.0,
+    "timing_keys": [],
+    "cwd": ".",
+    "compare_stderr": true,
+    "objective": null,
+    "golden_lines": [],
+    "attach": null
+  },
+  "artifact": ".fleet/build/src/graec",
+  "generated_files": {
+    ".fleet/telemetry.py": "#!/usr/bin/env python3\n\"\"\"Frozen CLI correctness and timing workload. Extra streams are synthetic.\n\nNo benchmark input or oracle may change during source optimization. Large files\nare temporary and deleted before runner synchronization. Timings include complete\ngraec processes (startup, allocation, codec and file I/O), not just CPU kernels.\n\"\"\"\nimport argparse\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport resource\nimport shutil\nimport struct\nimport subprocess\nimport tempfile\nimport time\n\nROOT = Path(__file__).resolve().parents[1]\nBUILD = ROOT / '.fleet/build'\nFLAGS = ['-n16', '-j64', '-r256', '-m']\n\ndef run(args, **kwargs):\n    subprocess.run([str(a) for a in args], check=True, **kwargs)\n\ndef digest(path):\n    h = hashlib.sha256()\n    with open(path, 'rb') as f:\n        for b in iter(lambda: f.read(1024 * 1024), b''):\n            h.update(b)\n    return {'bytes': path.stat().st_size, 'sha256': h.hexdigest()}\n\ndef stream(kind, seed, samples):\n    # Specified integer PRNG, independent of Python's random implementation.\n    out = bytearray(2 * samples)\n    x = seed\n    value = 31000\n    for i in range(samples):\n        x ^= (x << 13) & 0xffffffff\n        x ^= x >> 17\n        x ^= (x << 5) & 0xffffffff\n        if kind == 'entropy':\n            v = x & 65535\n        elif kind == 'constant':\n            v = (0, 65535, 32768, 17321)[(i // 16384) % 4]\n        else:\n            value = max(0, min(65535, value + (x % 17) - 8))\n            v = value\n            if kind == 'spikes' and i % 97 == 0:\n                v = x & 65535\n        struct.pack_into('>H', out, i * 2, v)\n    return out\n\ndef prepare(tmp, graec, heldout=False, full=False):\n    cases = []\n    if not heldout:\n        typical = tmp / 'typical.dat'\n        run([graec, '-d', *FLAGS, ROOT / 'data/typical.rz', typical])\n        data = typical.read_bytes()\n        typical.unlink()\n        path = tmp / 'upstream.dat'\n        with path.open('wb') as f:\n            for _ in range(500 if full else 1):\n                f.write(data)\n        cases.append(('upstream500' if full else 'upstream', path))\n    for kind in ['smooth', 'spikes', 'constant', 'entropy']:\n        path = tmp / (kind + '.dat')\n        data = stream(kind, 0x915ac37b if heldout else 0x13579bdf,\n                      65536 if heldout else 524288)\n        with path.open('wb') as f:\n            for _ in range(16 if full else 1):\n                f.write(data)\n        cases.append((('heldout-' if heldout else ('full-' if full else '')) + kind, path))\n    if heldout:\n        # Block / RSI boundaries, extrema and direction changes.\n        for n in [64, 128, 16320, 16384, 16448]:\n            path = tmp / ('boundary-%d.dat' % n)\n            path.write_bytes(b''.join(struct.pack('>H', [0, 65535, 1, 32767, 32768, 65534][i % 6]) for i in range(n)))\n            cases.append(('boundary-%d' % n, path))\n    return cases\n\ndef codec_checks(graec, tmp, cases, oracle, create=False, timed=False, repeats=1, direction='both'):\n    checks = {}\n    rows = []\n    for name, raw in cases:\n        enc, dec = tmp / 'encoded.rz', tmp / 'decoded.dat'\n        raw_hash = digest(raw)\n        for rep in range(repeats):\n            t0 = time.perf_counter_ns()\n            run([graec, *FLAGS, raw, enc])\n            t1 = time.perf_counter_ns()\n            run([graec, '-d', *FLAGS, enc, dec])\n            t2 = time.perf_counter_ns()\n            result = {'raw': raw_hash, 'encoded': digest(enc), 'decoded': digest(dec)}\n            assert result['raw'] == result['decoded'], (name, 'round trip')\n            if not create:\n                assert result == oracle[name], (name, result, oracle[name])\n            checks[name] = result\n            rows.append({'case': name, 'repeat': rep,\n                         'encode_wall_s': (t1-t0)/1e9, 'decode_wall_s': (t2-t1)/1e9})\n        enc.unlink()\n        dec.unlink()\n    return checks, rows\n\ndef configure():\n    # Reconfigure after runner relocation; never change Release compiler flags.\n    shutil.rmtree(BUILD, ignore_errors=True)\n    run(['cmake', '-S', ROOT, '-B', BUILD, '-DCMAKE_BUILD_TYPE=Release',\n         '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', '-DCMAKE_C_COMPILER=' + os.environ.get('CC', 'cc')])\n    run(['cmake', '--build', BUILD, '-j4'])\n\ndef main():\n    p = argparse.ArgumentParser()\n    p.add_argument('mode', choices=['build', 'test', 'oracle', 'check', 'workload', 'profile'])\n    p.add_argument('--graec', type=Path)\n    p.add_argument('--report', type=Path)\n    args = p.parse_args()\n    graec = (args.graec or BUILD / 'src/graec').resolve()\n    os.environ['LD_LIBRARY_PATH'] = str(graec.parent)\n    if args.mode == 'build':\n        configure()\n        return\n    if args.mode == 'test':\n        configure()\n        try:\n            run(['ctest', '--test-dir', BUILD, '--output-on-failure'])\n            run(['cmake', '--build', BUILD, '--target', 'bench'])\n        finally:\n            for name in ['bench.dat', 'bench.rz', 'dec.dat', 'typical.dat']:\n                (BUILD / 'src' / name).unlink(missing_ok=True)\n            for name in ['test.dat', 'test.rz']:\n                (BUILD / 'tests' / name).unlink(missing_ok=True)\n    oracle_path = ROOT / '.fleet/oracle.json'\n    create = args.mode == 'oracle'\n    oracle = {} if create else json.loads(oracle_path.read_text())\n    checks, rows = {}, []\n    with tempfile.TemporaryDirectory(dir=BUILD.parent) as td:\n        tmp = Path(td)\n        full = args.mode in ['oracle', 'workload', 'profile']\n        cases = prepare(tmp, graec, full=full)\n        if args.mode == 'profile':\n            # Actual complete upstream encode/decode, perf symbols from Release.\n            for name, raw in cases[:1]:\n                for direction in ['encode', 'decode']:\n                    enc = tmp / 'encoded.rz'\n                    argv = [graec, *FLAGS, raw, enc] if direction == 'encode' else [graec, '-d', *FLAGS, enc, tmp / 'decoded.dat']\n                    output = ROOT / '.evo/evidence' / ('perf-' + direction)\n                    output.parent.mkdir(parents=True, exist_ok=True)\n                    run(['perf', 'record', '-e', 'cycles:u', '-F', '999', '-o', str(output) + '.data', '--', *argv])\n                    with open(str(output) + '.txt', 'w') as f:\n                        run(['perf', 'report', '-i', str(output) + '.data', '--stdio', '--no-children', '--sort', 'dso,symbol'], stdout=f)\n                    Path(str(output) + '.data').unlink()\n            return\n        c, r = codec_checks(graec, tmp, cases, oracle, create=create,\n                            repeats=2 if args.mode == 'workload' else 1)\n        checks.update(c); rows.extend(r)\n        if args.mode in ['oracle', 'test', 'check']:\n            if create:\n                c, r = codec_checks(graec, tmp, prepare(tmp, graec), oracle, create=True)\n                checks.update(c); rows.extend(r)\n            c, r = codec_checks(graec, tmp, prepare(tmp, graec, heldout=True), oracle, create=create)\n            checks.update(c); rows.extend(r)\n    if create:\n        oracle_path.write_text(json.dumps(checks, indent=2) + '\\n')\n    report = {'scope': 'complete graec processes including file IO; sequential, warm filesystem',\n              'settings': FLAGS, 'rows': rows,\n              'children_peak_rss_kib': resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss}\n    if args.report:\n        args.report.parent.mkdir(parents=True, exist_ok=True)\n        args.report.write_text(json.dumps(report, indent=2) + '\\n')\n    # Stable stdout; native measurement records complete harness wall time too.\n    print('byte-exact telemetry checks passed: ' + ','.join(checks))\n\nif __name__ == '__main__':\n    main()\n",
+    ".fleet/oracle.json": "{\n  \"upstream500\": {\n    \"raw\": {\n      \"bytes\": 524288000,\n      \"sha256\": \"02e0602df77f2683fc822225ccc636e9a110046dee61c91ef93015b083b00091\"\n    },\n    \"encoded\": {\n      \"bytes\": 368511813,\n      \"sha256\": \"e9f28f2a6b4f97ae498af7908eec52fe4f5468ef06876f5b4c8ff4f1897d397a\"\n    },\n    \"decoded\": {\n      \"bytes\": 524288000,\n      \"sha256\": \"02e0602df77f2683fc822225ccc636e9a110046dee61c91ef93015b083b00091\"\n    }\n  },\n  \"full-smooth\": {\n    \"raw\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"8da48103511ce54f537a2cc25e227457cd990900b16da1535bb885f645f72334\"\n    },\n    \"encoded\": {\n      \"bytes\": 4861854,\n      \"sha256\": \"4f749cb6a75e82a6f1ec4c65210ed1d4e9d426132bf2a5e932a6bfae13e7cd4e\"\n    },\n    \"decoded\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"8da48103511ce54f537a2cc25e227457cd990900b16da1535bb885f645f72334\"\n    }\n  },\n  \"full-spikes\": {\n    \"raw\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"f89c77f6998025574c19c965e9619dc22e8b30e624b1c8cfbdd4850d4a52743c\"\n    },\n    \"encoded\": {\n      \"bytes\": 9630106,\n      \"sha256\": \"60a7107623d990a0d131427426b48e28bcaee698d15ee50125d78d81be68d7ba\"\n    },\n    \"decoded\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"f89c77f6998025574c19c965e9619dc22e8b30e624b1c8cfbdd4850d4a52743c\"\n    }\n  },\n  \"full-constant\": {\n    \"raw\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"40129c27497007dbd0b42fdff72a0c9d82acdeef85d91f921d1d23b7bbe72a11\"\n    },\n    \"encoded\": {\n      \"bytes\": 3584,\n      \"sha256\": \"17d155e727a4cc98bfe6189e966aef7d4b9abb6ec10d88211baecf61802ec8dd\"\n    },\n    \"decoded\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"40129c27497007dbd0b42fdff72a0c9d82acdeef85d91f921d1d23b7bbe72a11\"\n    }\n  },\n  \"full-entropy\": {\n    \"raw\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"6ce70cd598723a4cb5c452621dbc22f66a5fb165f1c428559cbf92af22da3b35\"\n    },\n    \"encoded\": {\n      \"bytes\": 16842752,\n      \"sha256\": \"2cdbc8825b8d24ee59322963dc91ee2ff5fd8b2dbf9bab8190aa1a91dcaee195\"\n    },\n    \"decoded\": {\n      \"bytes\": 16777216,\n      \"sha256\": \"6ce70cd598723a4cb5c452621dbc22f66a5fb165f1c428559cbf92af22da3b35\"\n    }\n  },\n  \"upstream\": {\n    \"raw\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"e6e1bf684916d765320bc1064c20c5801202e3a6c595c9caca0928e1fe6df896\"\n    },\n    \"encoded\": {\n      \"bytes\": 737024,\n      \"sha256\": \"16a7f994a672c74daaf42e1e990f96e6001fe7fe0698b637a025686ca03f6068\"\n    },\n    \"decoded\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"e6e1bf684916d765320bc1064c20c5801202e3a6c595c9caca0928e1fe6df896\"\n    }\n  },\n  \"smooth\": {\n    \"raw\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"1be4fad54774319a54181ecd7b9517480f4cc5fad44d50e1f0f145de39568272\"\n    },\n    \"encoded\": {\n      \"bytes\": 303866,\n      \"sha256\": \"57067e4861108346418cf969306e3a20c946f59aa737322a3f6f48ba85cc35e6\"\n    },\n    \"decoded\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"1be4fad54774319a54181ecd7b9517480f4cc5fad44d50e1f0f145de39568272\"\n    }\n  },\n  \"spikes\": {\n    \"raw\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"49358957c73611defb3d4abcb3d0ed9609acbe573f803c63c7305c958ccae29c\"\n    },\n    \"encoded\": {\n      \"bytes\": 601882,\n      \"sha256\": \"9a823d0a055ffcaaec3f2b876bbd3a7e287b2457784c069cf04e0b062a9a27c7\"\n    },\n    \"decoded\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"49358957c73611defb3d4abcb3d0ed9609acbe573f803c63c7305c958ccae29c\"\n    }\n  },\n  \"constant\": {\n    \"raw\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"37ec538f5a6fa8604faa775bbf402243e4d26d56924e4b65a6a873667f74aed2\"\n    },\n    \"encoded\": {\n      \"bytes\": 224,\n      \"sha256\": \"76364d31a8e6789daad036330387430e720ceef783deef490c37d3a8f95d425c\"\n    },\n    \"decoded\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"37ec538f5a6fa8604faa775bbf402243e4d26d56924e4b65a6a873667f74aed2\"\n    }\n  },\n  \"entropy\": {\n    \"raw\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"2031272156e151000fbf20e1248a8410d6bb10019b00f9e08b869dcd71e75b03\"\n    },\n    \"encoded\": {\n      \"bytes\": 1052672,\n      \"sha256\": \"bc3772dd7fd4a38a3e6b8e15b437035619ad6dc5b4296817998f6bb26c3abdc7\"\n    },\n    \"decoded\": {\n      \"bytes\": 1048576,\n      \"sha256\": \"2031272156e151000fbf20e1248a8410d6bb10019b00f9e08b869dcd71e75b03\"\n    }\n  },\n  \"heldout-smooth\": {\n    \"raw\": {\n      \"bytes\": 131072,\n      \"sha256\": \"5a71a492cf96bcf53a2f1b994fe95a3b629d82dfdcbe67bc77bad90f23420b8c\"\n    },\n    \"encoded\": {\n      \"bytes\": 37996,\n      \"sha256\": \"6283cab959a921ef91875a02e693330dbbb182144c719fc24540d55bef75c26a\"\n    },\n    \"decoded\": {\n      \"bytes\": 131072,\n      \"sha256\": \"5a71a492cf96bcf53a2f1b994fe95a3b629d82dfdcbe67bc77bad90f23420b8c\"\n    }\n  },\n  \"heldout-spikes\": {\n    \"raw\": {\n      \"bytes\": 131072,\n      \"sha256\": \"35e838f993603884790f22dfd74c22adc265c7ab3911db640900787db13df4b6\"\n    },\n    \"encoded\": {\n      \"bytes\": 75247,\n      \"sha256\": \"d602d68215dafb8d264afe4d78a5ac171b56f821c8f0065bf213e33495db0c8e\"\n    },\n    \"decoded\": {\n      \"bytes\": 131072,\n      \"sha256\": \"35e838f993603884790f22dfd74c22adc265c7ab3911db640900787db13df4b6\"\n    }\n  },\n  \"heldout-constant\": {\n    \"raw\": {\n      \"bytes\": 131072,\n      \"sha256\": \"244a8a18a7a2b5960935d7b73cac42b07273eb68b35af1335463766e13d773dd\"\n    },\n    \"encoded\": {\n      \"bytes\": 28,\n      \"sha256\": \"f831d27c83b4cbd99a7ba943ccc9bf7cc25f902f3b5eefec8db959cc87d5e462\"\n    },\n    \"decoded\": {\n      \"bytes\": 131072,\n      \"sha256\": \"244a8a18a7a2b5960935d7b73cac42b07273eb68b35af1335463766e13d773dd\"\n    }\n  },\n  \"heldout-entropy\": {\n    \"raw\": {\n      \"bytes\": 131072,\n      \"sha256\": \"64cc60a8ce6db7af20e1ff54e97ee8a6b83daacd841b994956a4e724268f816a\"\n    },\n    \"encoded\": {\n      \"bytes\": 131584,\n      \"sha256\": \"16743c97e6adaef750aa2e1063be3e27f0d587a9c7e90588ccfa0953083cf2c2\"\n    },\n    \"decoded\": {\n      \"bytes\": 131072,\n      \"sha256\": \"64cc60a8ce6db7af20e1ff54e97ee8a6b83daacd841b994956a4e724268f816a\"\n    }\n  },\n  \"boundary-64\": {\n    \"raw\": {\n      \"bytes\": 128,\n      \"sha256\": \"433d7261e3aeaa0f1a1fef6f94e7f62c8b4c4b81fe664829bcac2e0e251bfef5\"\n    },\n    \"encoded\": {\n      \"bytes\": 129,\n      \"sha256\": \"f2111d6248e88f84c6f41b6edd35c60e8f619c6577f71642f4a85ce19d43ea61\"\n    },\n    \"decoded\": {\n      \"bytes\": 128,\n      \"sha256\": \"433d7261e3aeaa0f1a1fef6f94e7f62c8b4c4b81fe664829bcac2e0e251bfef5\"\n    }\n  },\n  \"boundary-128\": {\n    \"raw\": {\n      \"bytes\": 256,\n      \"sha256\": \"d2d5dd34538ccf8f7389716204841f45c1bc72f865a7bf04ed6c0562a8c1dbc4\"\n    },\n    \"encoded\": {\n      \"bytes\": 257,\n      \"sha256\": \"6372d2cefa495aa0cb6e1f84969c8e411fee32a899cd7aeaab7465ef974f709c\"\n    },\n    \"decoded\": {\n      \"bytes\": 256,\n      \"sha256\": \"d2d5dd34538ccf8f7389716204841f45c1bc72f865a7bf04ed6c0562a8c1dbc4\"\n    }\n  },\n  \"boundary-16320\": {\n    \"raw\": {\n      \"bytes\": 32640,\n      \"sha256\": \"428b08fa94e56d6db49345e5ddb88a8cd50de974966333bb47f13db3f1d3fce4\"\n    },\n    \"encoded\": {\n      \"bytes\": 32768,\n      \"sha256\": \"1bce2765adf7462c7891dd628729e7e3c9d85e374385d954596c115b3388108e\"\n    },\n    \"decoded\": {\n      \"bytes\": 32640,\n      \"sha256\": \"428b08fa94e56d6db49345e5ddb88a8cd50de974966333bb47f13db3f1d3fce4\"\n    }\n  },\n  \"boundary-16384\": {\n    \"raw\": {\n      \"bytes\": 32768,\n      \"sha256\": \"3051d50903b6b5bc56e75194cdcfce2329b0122a9a9fb38b7e0f92065bc2dc2b\"\n    },\n    \"encoded\": {\n      \"bytes\": 32896,\n      \"sha256\": \"69e0a2a31245411a276c46da501002a27dbcfa357456ce453515a58ee978d266\"\n    },\n    \"decoded\": {\n      \"bytes\": 32768,\n      \"sha256\": \"3051d50903b6b5bc56e75194cdcfce2329b0122a9a9fb38b7e0f92065bc2dc2b\"\n    }\n  },\n  \"boundary-16448\": {\n    \"raw\": {\n      \"bytes\": 32896,\n      \"sha256\": \"c396838e2232f721c9f8b9b4b3e2bc579964aa55644914a653d6f88cfad6bb50\"\n    },\n    \"encoded\": {\n      \"bytes\": 33025,\n      \"sha256\": \"149fe14d4a62f1f7cacee5e9a90aee1731b226c750b105195ec774758aa6b597\"\n    },\n    \"decoded\": {\n      \"bytes\": 32896,\n      \"sha256\": \"c396838e2232f721c9f8b9b4b3e2bc579964aa55644914a653d6f88cfad6bb50\"\n    }\n  }\n}\n"
+  },
+  "build_outputs": [
+    ".fleet/build",
+    ".evo/setup-build",
+    ".evo/evidence",
+    ".fleet/last-wall.json"
+  ],
+  "harness_files": [
+    ".fleet/telemetry.py",
+    ".fleet/oracle.json",
+    "tests",
+    "data",
+    "src/benc.sh",
+    "src/bdec.sh",
+    "src/utime.c",
+    "src/graec.c"
+  ],
+  "entry_points": [
+    {
+      "id": "telemetry-check",
+      "description": "Small public CLI telemetry cases with held-out byte equality checks",
+      "artifact": ".fleet/build/src/graec",
+      "launch_mode": "driver",
+      "workload": {
+        "argv": [
+          "python3",
+          ".fleet/telemetry.py",
+          "check"
+        ],
+        "timeout_s": 90.0,
+        "timing_keys": [],
+        "cwd": ".",
+        "compare_stderr": true,
+        "objective": null,
+        "golden_lines": [],
+        "attach": null
+      },
+      "tests": [
+        [
+          "python3",
+          ".fleet/telemetry.py",
+          "check"
+        ]
+      ],
+      "compile_outputs": [
+        ".fleet/build/src/CMakeFiles/graec.dir/graec.c.o",
+        ".fleet/build/src/CMakeFiles/aec-shared-objects.dir/encode.c.o",
+        ".fleet/build/src/CMakeFiles/aec-shared-objects.dir/decode.c.o",
+        ".fleet/build/src/CMakeFiles/aec-shared-objects.dir/encode_accessors.c.o",
+        ".fleet/build/src/CMakeFiles/aec-shared-objects.dir/vector.c.o"
+      ],
+      "source_paths": [
+        "src/encode.c",
+        "src/decode.c"
+      ],
+      "functions": [],
+      "inputs": "Upstream typical.rz; synthetic 524288-sample MSB16 streams; held-out seed 0x915ac37b, 65536 samples, boundary lengths. Immutable oracle hashes.",
+      "setup": "Regenerate deterministic data, decode upstream fixture; no persistent corpus cache.",
+      "limitations": "CLI and filesystem overhead included; not flight telemetry evidence."
+    }
+  ],
+  "default_entry_point": "telemetry-check",
+  "description": "Unchanged Release GCC options; upstream 7 CTests and bench hard gates; 2 complete encode/decode repetitions of upstream 500 MiB and 4 x 16 MiB synthetic regimes. Held-out input correctness only. Native paired whole workload elapsed time includes generation and SHA256 checks; inner complete-process wall times and peak child RSS also recorded.",
+  "compiler": "cc",
+  "runtime": null,
+  "external_build": null,
+  "diagnostic_probes": null,
+  "diagnostic_collectors": []
+}
