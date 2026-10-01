@@ -467,6 +467,10 @@ static int m_split(struct aec_stream *strm)
     struct internal_state *state = strm->state;
 
     if (BUFFERSPACE(strm)) {
+        static const union {
+            uint16_t u;
+            unsigned char b[2];
+        } host_le = { 1 };
         int k = state->id - 1;
         size_t binary_part = (k * state->encoded_block_size) / 8 + 9;
 
@@ -479,14 +483,111 @@ static int m_split(struct aec_stream *strm)
         if (state->ref)
             *state->rsip++ = direct_get(strm, strm->bits_per_sample);
 
-        for (size_t i = 0; i < state->encoded_block_size; i++)
-            state->rsip[i] = direct_get_fs(strm) << k;
+        /* Decode the whole block with the bit reader state held in
+         * local variables. Equivalent to calling direct_get_fs() and
+         * direct_get() per sample but without the per sample struct
+         * field accesses and the byte wise reload chains of those
+         * inlined helpers. */
+        {
+            const size_t n = state->encoded_block_size;
+            uint32_t *rp = state->rsip;
+            const unsigned char *next_in = strm->next_in;
+            size_t avail_in = strm->avail_in;
+            uint64_t acc = state->acc;
+            int bitp = state->bitp;
 
-        if (k) {
-            for (size_t i = 0; i < state->encoded_block_size; i++)
-                *state->rsip++ += direct_get(strm, k);
-        } else {
-            state->rsip += state->encoded_block_size;
+            /* Fundamental sequence part. */
+            for (size_t i = 0; i < n; i++) {
+                uint32_t fs = 0;
+
+                /* Keep only the bitp valid bits. */
+                acc &= (UINT64_C(1) << bitp) - 1;
+
+                while (acc == 0) {
+                    uint64_t chunk;
+
+                    if (avail_in < 7) {
+                        /* Input exhausted; direct_get_fs() returns 0
+                         * without consuming input. */
+                        fs = 0;
+                        break;
+                    }
+
+                    if (avail_in >= 8) {
+                        memcpy(&chunk, next_in, 8);
+                        if (host_le.b[0])
+                            chunk = __builtin_bswap64(chunk);
+                        chunk >>= 8;
+                    } else {
+                        chunk = ((uint64_t)next_in[0] << 48)
+                            | ((uint64_t)next_in[1] << 40)
+                            | ((uint64_t)next_in[2] << 32)
+                            | ((uint64_t)next_in[3] << 24)
+                            | ((uint64_t)next_in[4] << 16)
+                            | ((uint64_t)next_in[5] << 8)
+                            | (uint64_t)next_in[6];
+                    }
+                    acc = (acc << 56) | chunk;
+                    next_in += 7;
+                    avail_in -= 7;
+                    fs += bitp;
+                    bitp = 56;
+                }
+
+                if (acc) {
+                    int j = 63 - __builtin_clzll(acc);
+
+                    fs += bitp - j - 1;
+                    bitp = j;
+                }
+                rp[i] = fs << k;
+            }
+
+            /* Binary part. */
+            if (k) {
+                const uint64_t mask = UINT64_MAX >> (64 - k);
+
+                for (size_t i = 0; i < n; i++) {
+                    if (bitp < k) {
+                        int b = (63 - bitp) >> 3;
+
+                        if ((size_t)b > avail_in)
+                            b = (int)avail_in;
+
+                        if (b) {
+                            uint64_t chunk;
+
+                            if (avail_in >= 8) {
+                                memcpy(&chunk, next_in, 8);
+                                if (host_le.b[0])
+                                    chunk = __builtin_bswap64(chunk);
+                                chunk >>= 64 - 8 * b;
+                            } else {
+                                chunk = 0;
+                                for (int j = 0; j < b; j++)
+                                    chunk = (chunk << 8) | next_in[j];
+                            }
+                            acc = (acc << (8 * b)) | chunk;
+                            next_in += b;
+                            avail_in -= b;
+                            bitp += b << 3;
+                        }
+                    }
+
+                    if (bitp >= k) {
+                        bitp -= k;
+                        rp[i] += (uint32_t)((acc >> bitp) & mask);
+                    }
+                }
+            }
+
+            rp += n;
+
+            state->rsip = rp;
+            strm->next_in = next_in;
+            strm->avail_in = avail_in;
+            state->acc = acc;
+            state->bitp = bitp;
         }
 
         strm->avail_out -= state->out_blklen;
@@ -499,6 +600,7 @@ static int m_split(struct aec_stream *strm)
     }
     return M_CONTINUE;
 }
+
 
 static int m_zero_output(struct aec_stream *strm)
 {
