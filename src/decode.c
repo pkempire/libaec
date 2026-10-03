@@ -408,7 +408,107 @@ static int m_next_cds(struct aec_stream *strm)
             strm->total_in * 8 - (strm->avail_in * 8 + state->bitp));
 
     if (state->rsi_size == RSI_USED_SIZE(state)) {
-        state->flush_output(strm);
+        if (state->flush_output == flush_msb_16) {
+            /* Inlined flush_msb_16() with the output pointer held in a
+             * local variable: the byte stores of put_msb_16() may
+             * alias strm->next_out itself and would otherwise force a
+             * reload of the output pointer for every sample in the
+             * generic loop. Semantics are identical to flush_msb_16()
+             * for this configuration; all others keep using the
+             * function pointer. */
+            uint32_t *f_end = state->rsip;
+            unsigned char *f_out = strm->next_out;
+
+            if (state->pp) {
+                if (state->flush_start == state->rsi_buffer
+                    && state->rsip > state->rsi_buffer) {
+                    state->last_out = *state->rsi_buffer;
+
+                    if (strm->flags & AEC_DATA_SIGNED) {
+                        uint32_t f_m = UINT32_C(1)
+                            << (strm->bits_per_sample - 1);
+                        /* Reference samples have to be sign extended */
+                        state->last_out =
+                            (state->last_out ^ f_m) - f_m;
+                    }
+                    *f_out++ =
+                        (unsigned char)((uint32_t)state->last_out >> 8);
+                    *f_out++ = (unsigned char)state->last_out;
+                    state->flush_start++;
+                }
+
+                {
+                    uint32_t f_data = state->last_out;
+                    uint32_t f_xmax = state->xmax;
+
+                    if (state->xmin == 0) {
+                        uint32_t f_med = state->xmax / 2 + 1;
+                        uint32_t *f_bp;
+
+                        for (f_bp = state->flush_start;
+                             f_bp < f_end;
+                             f_bp++) {
+                            uint32_t f_d = *f_bp;
+                            uint32_t f_half = (f_d >> 1) + (f_d & 1);
+                            /*in this case: data >= med == data & med */
+                            uint32_t f_mask =
+                                (f_data & f_med) ? f_xmax : 0;
+
+                            /*in this case: xmax - data == xmax ^ data */
+                            if (f_half <= (f_mask ^ f_data)) {
+                                f_data +=
+                                    (f_d >> 1)^(~((f_d & 1) - 1));
+                            } else {
+                                f_data = f_mask ^ f_d;
+                            }
+                            *f_out++ = (unsigned char)(f_data >> 8);
+                            *f_out++ = (unsigned char)f_data;
+                        }
+                        state->last_out = f_data;
+                    } else {
+                        uint32_t *f_bp;
+
+                        for (f_bp = state->flush_start;
+                             f_bp < f_end;
+                             f_bp++) {
+                            uint32_t f_d = *f_bp;
+                            uint32_t f_half = (f_d >> 1) + (f_d & 1);
+
+                            if ((int32_t)f_data < 0) {
+                                if (f_half <= f_xmax + f_data + 1) {
+                                    f_data +=
+                                        (f_d >> 1)^(~((f_d & 1) - 1));
+                                } else {
+                                    f_data = f_d - f_xmax - 1;
+                                }
+                            } else {
+                                if (f_half <= f_xmax - f_data) {
+                                    f_data +=
+                                        (f_d >> 1)^(~((f_d & 1) - 1));
+                                } else {
+                                    f_data = f_xmax - f_d;
+                                }
+                            }
+                            *f_out++ = (unsigned char)(f_data >> 8);
+                            *f_out++ = (unsigned char)f_data;
+                        }
+                        state->last_out = f_data;
+                    }
+                }
+            } else {
+                uint32_t *f_bp;
+
+                for (f_bp = state->flush_start; f_bp < f_end; f_bp++) {
+                    uint32_t f_v = *f_bp;
+                    *f_out++ = (unsigned char)(f_v >> 8);
+                    *f_out++ = (unsigned char)f_v;
+                }
+            }
+            strm->next_out = f_out;
+            state->flush_start = state->rsip;
+        } else {
+            state->flush_output(strm);
+        }
         state->flush_start = state->rsi_buffer;
         state->rsip = state->rsi_buffer;
         if (state->pp) {
@@ -423,6 +523,7 @@ static int m_next_cds(struct aec_stream *strm)
     }
     return m_id(strm);
 }
+
 
 static int m_split_output(struct aec_stream *strm)
 {
